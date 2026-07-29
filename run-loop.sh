@@ -62,6 +62,7 @@ log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$MAIN_L
 
 run_count=0
 error_count=0
+limit_streak=0
 total_cost=0
 
 save_state() {
@@ -84,8 +85,10 @@ trap 'log "shutting down (pid $$)"; save_state stopped; exit 0' INT TERM
 json_field() {
     local file="$1" field="$2"
     if [ "$HAS_JQ" -eq 1 ]; then
+        # has()/tostring, not '// empty': jq's // treats false as absent, so
+        # is_error:false would come back as "" and read as a failed run.
         sed -n '/^[[:space:]]*{/,$p' "$file" 2>/dev/null \
-            | jq -r "(.$field // empty) | tostring" 2>/dev/null || true
+            | jq -r "if has(\"$field\") then .$field | tostring else empty end" 2>/dev/null || true
     else
         sed -n "s/.*\"$field\":\"\{0,1\}\([^,\"}]*\).*/\1/p" "$file" 2>/dev/null | head -1 || true
     fi
@@ -154,12 +157,24 @@ while true; do
         # #3: exit code and is_error. subtype reads "success" on hard failures.
         if [ "$RUN_EXIT" -eq 0 ] && [ "$is_error" = "false" ]; then
             error_count=0
+            limit_streak=0
             [ -n "$cost" ] && total_cost=$(awk -v a="$total_cost" -v b="$cost" 'BEGIN{printf "%.4f", a+b}')
             log "run #$run_count [OK] cost=\$${cost:-?} total=\$$total_cost"
             [ -n "$result" ] && log "run #$run_count [RESULT] ${result:0:500}"
         elif rate_limited "$OUT_FILE" "$ERR_FILE"; then
-            # Not the agent's fault; do not spend the breaker on it.
-            log "run #$run_count [LIMIT] rate/session limit — ${result:-429} — backing off ${INTERVAL}s"
+            # Not the agent's fault; do not spend the breaker on it. But a
+            # session limit lasts hours, so a fixed interval means hundreds of
+            # pointless runs. Back off harder the longer it persists (#5).
+            limit_streak=$((limit_streak + 1))
+            limit_wait=$INTERVAL
+            [ "$limit_streak" -ge 3 ]  && limit_wait=$((INTERVAL * 4))
+            [ "$limit_streak" -ge 6 ]  && limit_wait=$((INTERVAL * 12))
+            [ "$limit_wait" -gt 3600 ] && limit_wait=3600
+            log "run #$run_count [LIMIT] rate/session limit (#$limit_streak) — ${result:-429}"
+            log "backing off ${limit_wait}s"
+            save_state rate_limited
+            sleep "$limit_wait"
+            continue
         else
             error_count=$((error_count + 1))
             status=$(json_field "$OUT_FILE" api_error_status)
