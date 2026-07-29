@@ -22,6 +22,70 @@ pasted verbatim. Anything we did *not* reproduce is marked **[unverified]** and 
 
 ---
 
+## Exact strings, one per heading
+
+If you pasted an error into a search engine and it sent you here, the literal text is below.
+Every string is copied out of a real run — no paraphrase, no reconstruction from memory.
+
+### `jq: parse error: Invalid numeric literal at line 1, column 9`
+
+Not a malformed payload. You merged stderr into stdout with `2>&1`, so a human-readable notice
+sits in front of the JSON. The column number varies with the notice; the shape does not.
+→ [#1](#1-2raw1-corrupts---output-format-json)
+
+### `Ignoring 7 permissions.allow entries from .claude/settings.json: this workspace has not been trusted.`
+
+Emitted on **stderr**, on every run, in any workspace that has a `.claude/settings.json` but has
+never been opened interactively. The count varies with the number of entries; `Ignoring 1
+permissions.allow entry` is the singular form. Your allowlist is doing nothing.
+→ [#2](#2-permissionsallow-is-silently-dropped-in-an-untrusted-workspace)
+
+### `Run Claude Code interactively here once and accept the trust dialog, or set projects["/Users/you/project"].hasTrustDialogAccepted: true in /Users/you/.claude.json.`
+
+The second half of the same stderr notice. This is the vendor's own remediation text — we
+reproduce it verbatim but have **[unverified]** whether either branch resolves it.
+→ [#2](#2-permissionsallow-is-silently-dropped-in-an-untrusted-workspace)
+
+### `You've hit your session limit · resets 3:50pm (Asia/Tokyo)`
+
+An API **429**, delivered as `.result` prose. Note the wording is **`session limit`** — not
+"usage limit", not "rate limit", not "quota exceeded". A grep written against those three
+phrases misses it, and the run lands in your failure branch. The reset time is rendered in the
+machine's local timezone.
+→ [#4](#4-a-429-will-trip-your-circuit-breaker)
+
+### `There's an issue with the selected model (no-such-model-xyz). It may not exist or you may not have access to it. Run --model to pick a different model.`
+
+An API **404**, also delivered as `.result` prose. Exit code `1`, `is_error: true`,
+`total_cost_usd: 0`, `num_turns: 1` — and `subtype: "success"`.
+→ [#3](#3-subtype-is-success-even-when-the-run-failed)
+
+### `"subtype":"success"` on a payload that also carries `"is_error":true`
+
+Not a contradiction the CLI will ever resolve for you. `subtype` has been `"success"` in every
+failure we have captured. Classify on `is_error`.
+→ [#3](#3-subtype-is-success-even-when-the-run-failed)
+
+### `"stop_reason":"stop_sequence"` on a run that never reached the model
+
+Observed on the 404 path. Nothing stopped at a stop sequence — nothing started. `stop_reason`
+describes a turn that did not happen, so it is not a health signal.
+→ [payload reference](#the---output-format-json-payload-field-reference)
+
+### `"terminal_reason":"api_error"` / `"terminal_reason":"completed"`
+
+The one string-typed field we have found that tracks reality: `"completed"` on success,
+`"api_error"` on both the 404 and the 429. Useful as a secondary check alongside `is_error`.
+→ [payload reference](#the---output-format-json-payload-field-reference)
+
+### `"api_error_status":404` / `"api_error_status":429` / `"api_error_status":null`
+
+`null` on success, an integer HTTP status on API failure. Branch on this rather than on prose
+the vendor is free to reword.
+→ [#4](#4-a-429-will-trip-your-circuit-breaker)
+
+---
+
 ## #1. `2>&1` corrupts `--output-format json`
 
 **Symptom.** `jq` refuses to parse output that looks like valid JSON when you cat it.
@@ -165,14 +229,21 @@ not have access to it. Run --model to pick a different model.
 
 **Verified exit-code contract**
 
-| Scenario | exit code | `.is_error` | `.subtype` |
-|---|---|---|---|
-| Normal completion | `0` | `false` | `success` |
-| Nonexistent model (API 404) | `1` | `true` | `success` |
-| Session/usage limit (API 429) | `1` | `true` | `success` |
+| Scenario | exit code | `.is_error` | `.subtype` | `.terminal_reason` | `.stop_reason` |
+|---|---|---|---|---|---|
+| Normal completion | `0` | `false` | `success` | `completed` | `end_turn` |
+| Nonexistent model (API 404) | `1` | `true` | `success` | `api_error` | `stop_sequence` |
+| Session/usage limit (API 429) | `1` | `true` | `success` | `api_error` | *not captured* |
 
 Three data points, not an exhaustive contract. Other failure classes **[unverified]**. Note
 that `subtype` is `success` in all three — it has never once been useful to us.
+
+Two fields in that table are worth separating. `terminal_reason` is the only *string* we have
+found that tracks reality (`completed` vs `api_error`), and it makes a decent secondary check
+alongside `is_error`. `stop_reason` is the opposite: on the 404 it reads `stop_sequence`, which
+describes a model turn that never happened. Do not health-check on it. Full field-by-field
+comparison of a success and a failure payload is in the
+[payload reference](#the---output-format-json-payload-field-reference).
 
 ---
 
@@ -289,35 +360,127 @@ one-off one. `--model no-such-model-xyz` in a loop for an hour costs nothing and
 
 ---
 
-## The `--output-format json` payload
+## The `--output-format json` payload: field reference
 
-Top-level keys observed on Claude Code as of 2026-07 (`claude-opus-5` / `claude-sonnet-5`):
+Every field below was read off two real payloads captured minutes apart on Claude Code as of
+2026-07 (macOS 15): one successful run, and one forced API 404 (`--model no-such-model-xyz`).
+Values are pasted, not described. This is an **observed shape, not a documented contract** —
+`// empty` every extraction and pin nothing you cannot tolerate breaking.
 
-```
-is_error, duration_api_ms, num_turns, stop_reason, session_id, total_cost_usd, usage,
-modelUsage, permission_denials, terminal_reason, fast_mode_state, fast_mode_disabled_reason,
-subtype, api_error_status, result, ttft_ms, ttft_stream_ms, time_to_request_ms, type,
-duration_ms, uuid
-```
+Reproduce the whole table yourself:
 
-`usage` contains:
-
-```
-input_tokens, cache_creation_input_tokens, cache_read_input_tokens, output_tokens,
-server_tool_use, service_tier, cache_creation, inference_geo, iterations, speed
+```sh
+claude -p 'Reply with exactly: ok' --output-format json > ok.json 2>/dev/null
+claude -p hi --model no-such-model-xyz --output-format json > err.json 2>/dev/null
+jq -n --slurpfile a ok.json --slurpfile b err.json '($a[0]|keys) - ($b[0]|keys)'
 ```
 
-The four fields worth wiring into any unattended runner:
+### Three keys exist only on the success path
+
+That last command prints:
+
+```json
+["time_to_request_ms", "ttft_ms", "ttft_stream_ms"]
+```
+
+The timing fields are **absent entirely** from a failed payload — not null, not zero, missing.
+`jq -r '.ttft_ms'` returns the string `null`, and any arithmetic you do on it produces a `jq`
+error mid-pipeline. The reverse set is empty: a failure adds no keys of its own.
+
+### Top-level fields
+
+| Field | Type | Success | API 404 | Notes |
+|---|---|---|---|---|
+| `type` | string | `"result"` | `"result"` | Constant in every payload we have seen. |
+| `subtype` | string | `"success"` | `"success"` | **Never useful.** `"success"` on every failure too (#3). |
+| `is_error` | bool | `false` | `true` | The one trustworthy success signal. Classify on this. |
+| `terminal_reason` | string | `"completed"` | `"api_error"` | Tracks reality. Good secondary check. |
+| `stop_reason` | string | `"end_turn"` | `"stop_sequence"` | Describes a turn that may never have happened. Not a health signal. |
+| `api_error_status` | number \| null | `null` | `404` | HTTP status. `429` on a session limit (#4). Branch on this, not on prose. |
+| `result` | string | agent's final text | error prose | Your audit trail. Log it whole. |
+| `num_turns` | number | `1` | `1` | `1` even when nothing ran — not a work indicator. |
+| `session_id` | string | uuid | uuid | Present on failures too. Use it to correlate logs. |
+| `uuid` | string | uuid | uuid | Distinct from `session_id`. Per-result identity. |
+| `total_cost_usd` | number | `0.1612767` | `0` | Sum it, alarm on it. `0` on API failure. |
+| `duration_ms` | number | `2135` | `1048` | Wall clock, including a failure's round trip. |
+| `duration_api_ms` | number | `1877` | `0` | `0` when the request never landed. |
+| `ttft_ms` | number | `2017` | *absent* | Time to first token. |
+| `ttft_stream_ms` | number | `2016` | *absent* | Effectively `ttft_ms`; both, in every sample. |
+| `time_to_request_ms` | number | `150` | *absent* | Local startup before the request goes out. |
+| `permission_denials` | array | `[]` | `[]` | Non-empty means the agent tried something your allowlist refused (#2). |
+| `usage` | object | populated | zeroed | See below. Never absent, but zeroed on failure. |
+| `modelUsage` | object | one key per model | `{}` | **Empty object on failure** — iterating it blind yields nothing, silently. |
+| `fast_mode_state` | string | `"off"` | `"off"` | |
+| `fast_mode_disabled_reason` | string | `"sdk_opt_in_required"` | `"sdk_opt_in_required"` | Present even when fast mode was never requested. |
+
+### `usage`
+
+| Field | Type | Success | API 404 |
+|---|---|---|---|
+| `input_tokens` | number | `2` | `0` |
+| `output_tokens` | number | `4` | `0` |
+| `cache_creation_input_tokens` | number | `25673` | `0` |
+| `cache_read_input_tokens` | number | `23909` | `0` |
+| `service_tier` | string | `"standard"` | `"standard"` |
+| `speed` | string | `"standard"` | `"standard"` |
+| `inference_geo` | string | `"not_available"` | `""` — empty string, not the success sentinel |
+| `server_tool_use` | object | `{"web_search_requests":0,"web_fetch_requests":0}` | same |
+| `cache_creation` | object | `{"ephemeral_1h_input_tokens":25673,"ephemeral_5m_input_tokens":0}` | both `0` |
+| `iterations` | array | one object per message | `[]` |
+
+`usage.iterations[]` repeats the per-message token counts (`input_tokens`, `output_tokens`,
+`cache_read_input_tokens`, `cache_creation_input_tokens`, `cache_creation`, `type: "message"`).
+The top-level `usage` totals are what you want; `iterations` is for attributing a multi-turn run.
+
+Note that the token counts are **not** additive in the obvious way: a single-turn "reply with
+ok" run reported `input_tokens: 2` against `cache_read_input_tokens: 23909`. If you are alarming
+on input size, the field you want is the cache pair, not `input_tokens`.
+
+### `modelUsage.<model-id>`
+
+Keyed by model id (`"claude-sonnet-5"`, `"claude-opus-5"`, …), one entry per model the run
+touched. **`{}` on failure** — so `.modelUsage | to_entries[]` produces zero rows and any
+downstream sum silently reads `0` rather than erroring.
+
+| Field | Type | Observed |
+|---|---|---|
+| `inputTokens` | number | `2` |
+| `outputTokens` | number | `4` |
+| `cacheReadInputTokens` | number | `23909` |
+| `cacheCreationInputTokens` | number | `25673` |
+| `webSearchRequests` | number | `0` |
+| `costUSD` | number | `0.1612767` |
+| `contextWindow` | number | `1000000` |
+| `maxOutputTokens` | number | `64000` |
+| `canonicalModel` | string | `"claude-sonnet-5"` |
+| `provider` | string | `"firstParty"` |
+
+Note the camelCase — `modelUsage` uses a different naming convention from `usage` right next to
+it in the same object. `.modelUsage["claude-sonnet-5"].input_tokens` returns `null`, not an error.
+
+### The five fields worth wiring into any unattended runner
 
 | Field | Use |
 |---|---|
-| `is_error` | the only trustworthy success signal in the payload (see #3) |
+| `is_error` | the only trustworthy success signal in the payload (#3) |
+| `api_error_status` | `429` → back off without spending the breaker; `null` → not an API fault (#4) |
 | `total_cost_usd` | per-run spend; sum it, alarm on it |
 | `result` | the agent's final text — log it, that is your audit trail |
 | `permission_denials` | non-empty means the agent tried something your allowlist refused |
 
-This is an observed shape, not a documented contract. Pin nothing to it that you cannot
-tolerate breaking; `// empty` every extraction.
+A safe extraction, given the absent-key and empty-object cases above:
+
+```sh
+json_field() { jq -r --arg k "$2" '.[$k] // empty' "$1" 2>/dev/null; }
+
+is_error=$(json_field "$out" is_error)
+status=$(json_field "$out" api_error_status)     # empty on success, not "null"
+cost=$(jq -r '.total_cost_usd // 0' "$out" 2>/dev/null)
+```
+
+`// empty` rather than `// "null"` matters: on the success path `api_error_status` is JSON
+`null`, and a bare `jq -r` renders that as the four-character string `null`, which is truthy in
+every shell test you will write.
 
 ---
 
@@ -376,7 +539,12 @@ Verified here, by reproduction, on macOS 15 with Claude Code as of 2026-07:
 - #5 in production, not in a test harness — 105 cycles, 21 breaker trips, 104 state rollbacks,
   102 payloads carrying `api_error_status: 429`, all counted out of the log with the `grep`s
   printed in that section
-- the payload key list above
+- the entire [payload field reference](#the---output-format-json-payload-field-reference) — every
+  value in those four tables was read off two payloads captured minutes apart (one success, one
+  forced 404), including the three timing keys that are absent rather than null on the failure
+  path, `modelUsage: {}` on failure, and the `usage`/`modelUsage` snake_case/camelCase split
+- every string in [Exact strings, one per heading](#exact-strings-one-per-heading), copied out of
+  a real run rather than paraphrased
 - `run-loop.sh` itself, end to end, on both a successful run and a 429
 
 Not verified, and deliberately not claimed:
