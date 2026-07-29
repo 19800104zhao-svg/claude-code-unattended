@@ -34,9 +34,28 @@ Prefer one page per error? Each of the most common strings also has a self-conta
 If you pasted an error into a search engine and it sent you here, the literal text is below.
 Every string is copied out of a real run — no paraphrase, no reconstruction from memory.
 
-Most entries also have a **standalone, self-contained answer** as a pinned issue, if you would
-rather read one page about one error than scroll this file:
-[the error index](https://github.com/19800104zhao-svg/claude-code-unattended/issues?q=is%3Aissue+label%3Aerror-index).
+Most entries also have a **standalone, self-contained answer** — one page, one error — if you
+would rather not scroll this file. The whole index, in one place:
+
+| Error string | One-page answer |
+|---|---|
+| `jq: parse error: Invalid numeric literal at line 1, column 9` | [issue #3](https://github.com/19800104zhao-svg/claude-code-unattended/issues/3) |
+| `Ignoring N permissions.allow entries ... this workspace has not been trusted.` | [issue #1](https://github.com/19800104zhao-svg/claude-code-unattended/issues/1) |
+| `You've hit your session limit · resets 3:50pm (Asia/Tokyo)` | [issue #2](https://github.com/19800104zhao-svg/claude-code-unattended/issues/2) |
+| `"subtype":"success"` on a payload that also carries `"is_error":true` | [issue #4](https://github.com/19800104zhao-svg/claude-code-unattended/issues/4) |
+| `"stop_reason":"stop_sequence"` on a run that never reached the model | [issue #5](https://github.com/19800104zhao-svg/claude-code-unattended/issues/5) |
+| `There's an issue with the selected model (...). It may not exist or you may not have access to it.` | [issue #6](https://github.com/19800104zhao-svg/claude-code-unattended/issues/6) |
+| `"api_error_status":404` / `:429` / `:null` | [issue #7](https://github.com/19800104zhao-svg/claude-code-unattended/issues/7) |
+| `Error: When using --print, --output-format=stream-json requires --verbose` | [issue #8](https://github.com/19800104zhao-svg/claude-code-unattended/issues/8) |
+| `error: option '--output-format <format>' argument 'yaml' is invalid.` | [issue #9](https://github.com/19800104zhao-svg/claude-code-unattended/issues/9) |
+| `No conversation found with session ID: ...` | [issue #10](https://github.com/19800104zhao-svg/claude-code-unattended/issues/10) |
+| `Error: Input must be provided either through stdin or as a prompt argument when using --print` | [issue #11](https://github.com/19800104zhao-svg/claude-code-unattended/issues/11) |
+| `Warning: no stdin data received in 3s, proceeding without it.` | [issue #12](https://github.com/19800104zhao-svg/claude-code-unattended/issues/12) |
+| `claude -p` exits `143` or `137` with a zero-byte stdout | [issue #13](https://github.com/19800104zhao-svg/claude-code-unattended/issues/13) |
+
+Machine-readable view of the same list:
+[`label:error-index`](https://github.com/19800104zhao-svg/claude-code-unattended/issues?q=is%3Aissue+label%3Aerror-index).
+Those issues are maintainer-authored answers, not bug reports — nothing there is awaiting a fix.
 
 ### `jq: parse error: Invalid numeric literal at line 1, column 9`
 
@@ -100,27 +119,27 @@ the vendor is free to reword.
 On **stderr**, and stdout is left **completely empty** — no JSON, not even an error payload.
 Exit code `1`. This is a pre-flight failure: the CLI rejected your arguments and never called
 the API.
-→ [#6](#6-some-failures-produce-no-json-at-all-and-your-jq-check-will-not-notice)
+→ [#6](#6-some-failures-produce-no-json-at-all-and-your-jq-check-will-not-notice) · [standalone answer](https://github.com/19800104zhao-svg/claude-code-unattended/issues/8)
 
 ### `error: option '--output-format <format>' argument 'yaml' is invalid. Allowed choices are text, json, stream-json.`
 
 Same class. Note this one is lowercase `error:` from the argument parser, while the message
 above is capitalised `Error:` from the application — a grep anchored on `^Error` misses half
 of them. Exit `1`, stdout empty.
-→ [#6](#6-some-failures-produce-no-json-at-all-and-your-jq-check-will-not-notice)
+→ [#6](#6-some-failures-produce-no-json-at-all-and-your-jq-check-will-not-notice) · [standalone answer](https://github.com/19800104zhao-svg/claude-code-unattended/issues/9)
 
 ### `No conversation found with session ID: 00000000-0000-0000-0000-000000000000`
 
 `--resume` with a session ID that no longer exists. Exit `1`, stdout empty. Relevant if your
 runner persists a session ID across restarts: sessions do not live forever, and the day one
 expires your loop starts producing zero-byte output.
-→ [#6](#6-some-failures-produce-no-json-at-all-and-your-jq-check-will-not-notice)
+→ [#6](#6-some-failures-produce-no-json-at-all-and-your-jq-check-will-not-notice) · [standalone answer](https://github.com/19800104zhao-svg/claude-code-unattended/issues/10)
 
 ### `Error: Input must be provided either through stdin or as a prompt argument when using --print`
 
 An empty prompt string. Exit `1`, stdout empty. Easy to hit unattended when the prompt comes
 from a file that was truncated, or a variable that failed to expand.
-→ [#6](#6-some-failures-produce-no-json-at-all-and-your-jq-check-will-not-notice)
+→ [#6](#6-some-failures-produce-no-json-at-all-and-your-jq-check-will-not-notice) · [standalone answer](https://github.com/19800104zhao-svg/claude-code-unattended/issues/11)
 
 ### `error: unknown option '--no-such-flag'`
 
@@ -133,14 +152,14 @@ renamed in a future release fails exactly like this, and the failure is silent d
 Not an error — a **3-second stall on every run** whose stdin is not a terminal and not
 redirected, which is every cron job, CI step, and backgrounded loop. The run then proceeds
 normally. Fix is `< /dev/null`.
-→ [#7](#7-every-backgrounded-run-waits-3-seconds-for-stdin-that-never-comes)
+→ [#7](#7-every-backgrounded-run-waits-3-seconds-for-stdin-that-never-comes) · [standalone answer](https://github.com/19800104zhao-svg/claude-code-unattended/issues/12)
 
 ### `exit code 143` / `exit code 137` with a zero-byte stdout
 
 Your runner's own timeout killed the process. `143` is SIGTERM (what `timeout` sends by
 default), `137` is SIGKILL. **Neither leaves any JSON behind** — the output file is 0 bytes,
 so there is nothing to classify.
-→ [#6](#6-some-failures-produce-no-json-at-all-and-your-jq-check-will-not-notice)
+→ [#6](#6-some-failures-produce-no-json-at-all-and-your-jq-check-will-not-notice) · [standalone answer](https://github.com/19800104zhao-svg/claude-code-unattended/issues/13)
 
 ---
 
