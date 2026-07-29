@@ -22,6 +22,10 @@ Prefer one page per error? Each of the most common strings also has a self-conta
 | Your script logged a **failed** run as successful | `.subtype` is `"success"` even when `.is_error` is `true`. Classify on `.is_error`, not `.subtype`. | [#3](#3-subtype-is-success-even-when-the-run-failed) |
 | `You've hit your session limit · resets 3:50pm (Asia/Tokyo)` | A 429. Your loop is counting it as an agent failure and will trip its own circuit breaker on it. | [#4](#4-a-429-will-trip-your-circuit-breaker) |
 | Your loop tripped the breaker, cooled down, and tripped it again — for hours | The breaker's cooldown is shorter than the rate-limit window, so it oscillates instead of stopping. Meanwhile your restore-on-failure handler is eating the work that succeeded. | [#5](#5-a-breaker-cannot-outlast-a-rate-limit-and-your-restore-handler-eats-the-good-runs) |
+| The output file is **zero bytes** and nothing logged an error | A pre-flight failure (bad args, dead `--resume` session) or your own timeout killing the run. No JSON is produced at all, and `jq -r` returns 0 on empty input, so the pipeline stays quiet. | [#6](#6-some-failures-produce-no-json-at-all-and-your-jq-check-will-not-notice) |
+| Exit code **143** or **137**, empty output | Your runner's timeout sent SIGTERM / SIGKILL. Exit codes above 128 are signals, not application failures. | [#6](#6-some-failures-produce-no-json-at-all-and-your-jq-check-will-not-notice) |
+| Every run is mysteriously ~3s slower than it should be | `claude -p` waits 3s for stdin whenever stdin is not a terminal — i.e. on every cron, CI, and backgrounded run. Add `< /dev/null`. | [#7](#7-every-backgrounded-run-waits-3-seconds-for-stdin-that-never-comes) |
+| Your runner prints its final line, exits, and your terminal still hangs | Your timeout watchdog's `sleep` was orphaned instead of killed, and it still holds the stdout pipe open. Also leaks one process per run. | [#9](#9-your-timeout-watchdog-leaks-a-process-and-holds-the-pipe-open) |
 
 ---
 
@@ -90,6 +94,53 @@ The one string-typed field we have found that tracks reality: `"completed"` on s
 `null` on success, an integer HTTP status on API failure. Branch on this rather than on prose
 the vendor is free to reword.
 → [#4](#4-a-429-will-trip-your-circuit-breaker) · [standalone answer](https://github.com/19800104zhao-svg/claude-code-unattended/issues/7)
+
+### `Error: When using --print, --output-format=stream-json requires --verbose`
+
+On **stderr**, and stdout is left **completely empty** — no JSON, not even an error payload.
+Exit code `1`. This is a pre-flight failure: the CLI rejected your arguments and never called
+the API.
+→ [#6](#6-some-failures-produce-no-json-at-all-and-your-jq-check-will-not-notice)
+
+### `error: option '--output-format <format>' argument 'yaml' is invalid. Allowed choices are text, json, stream-json.`
+
+Same class. Note this one is lowercase `error:` from the argument parser, while the message
+above is capitalised `Error:` from the application — a grep anchored on `^Error` misses half
+of them. Exit `1`, stdout empty.
+→ [#6](#6-some-failures-produce-no-json-at-all-and-your-jq-check-will-not-notice)
+
+### `No conversation found with session ID: 00000000-0000-0000-0000-000000000000`
+
+`--resume` with a session ID that no longer exists. Exit `1`, stdout empty. Relevant if your
+runner persists a session ID across restarts: sessions do not live forever, and the day one
+expires your loop starts producing zero-byte output.
+→ [#6](#6-some-failures-produce-no-json-at-all-and-your-jq-check-will-not-notice)
+
+### `Error: Input must be provided either through stdin or as a prompt argument when using --print`
+
+An empty prompt string. Exit `1`, stdout empty. Easy to hit unattended when the prompt comes
+from a file that was truncated, or a variable that failed to expand.
+→ [#6](#6-some-failures-produce-no-json-at-all-and-your-jq-check-will-not-notice)
+
+### `error: unknown option '--no-such-flag'`
+
+A typo'd or removed flag. Exit `1`, stdout empty. Worth naming because a flag that gets
+renamed in a future release fails exactly like this, and the failure is silent downstream.
+→ [#6](#6-some-failures-produce-no-json-at-all-and-your-jq-check-will-not-notice)
+
+### `Warning: no stdin data received in 3s, proceeding without it. If piping from a slow command, redirect stdin explicitly: < /dev/null to skip, or wait longer.`
+
+Not an error — a **3-second stall on every run** whose stdin is not a terminal and not
+redirected, which is every cron job, CI step, and backgrounded loop. The run then proceeds
+normally. Fix is `< /dev/null`.
+→ [#7](#7-every-backgrounded-run-waits-3-seconds-for-stdin-that-never-comes)
+
+### `exit code 143` / `exit code 137` with a zero-byte stdout
+
+Your runner's own timeout killed the process. `143` is SIGTERM (what `timeout` sends by
+default), `137` is SIGKILL. **Neither leaves any JSON behind** — the output file is 0 bytes,
+so there is nothing to classify.
+→ [#6](#6-some-failures-produce-no-json-at-all-and-your-jq-check-will-not-notice)
 
 ---
 
@@ -367,6 +418,222 @@ one-off one. `--model no-such-model-xyz` in a loop for an hour costs nothing and
 
 ---
 
+## #6. Some failures produce no JSON at all, and your jq check will not notice
+
+**Symptom.** A run does nothing, your log records no error, and the loop carries on. Later you
+find the output file is zero bytes.
+
+**Cause.** `claude -p --output-format json` has **two distinct failure surfaces**, and almost
+everything written about it — including sections #1–#5 above — only describes the first:
+
+| | stdout | How you detect it |
+|---|---|---|
+| **In-flight failure** (API 404, 429) | A **complete JSON payload** with `is_error: true` | `.is_error`, `.api_error_status` |
+| **Pre-flight failure** (bad args, dead session) | **0 bytes** | stderr text + exit code only |
+| **Killed run** (your own timeout) | **0 bytes** | exit code only |
+
+If your classifier reads the JSON, the bottom two rows are invisible to it. There is no payload
+to read.
+
+**The zero-byte set, reproduced.** Every one of these exits non-zero with an empty stdout:
+
+```sh
+claude -p 'hi' --output-format stream-json        # exit 1
+claude -p 'hi' --output-format yaml               # exit 1
+claude -p 'hi' --resume 00000000-0000-0000-0000-000000000000   # exit 1
+claude -p ''  --output-format json                # exit 1
+claude -p 'hi' --output-format json --no-such-flag             # exit 1
+```
+
+| Scenario | exit | stdout | stderr |
+|---|---|---|---|
+| `stream-json` without `--verbose` | `1` | 0 bytes | `Error: When using --print, --output-format=stream-json requires --verbose` |
+| Invalid `--output-format` value | `1` | 0 bytes | `error: option '--output-format <format>' argument 'yaml' is invalid. Allowed choices are text, json, stream-json.` |
+| `--resume` a dead session ID | `1` | 0 bytes | `No conversation found with session ID: <uuid>` |
+| Empty prompt | `1` | 0 bytes | `Error: Input must be provided either through stdin or as a prompt argument when using --print` |
+| Unknown flag | `1` | 0 bytes | `error: unknown option '--no-such-flag'` |
+| **SIGTERM** (what `timeout` sends) | `143` | 0 bytes | — |
+| **SIGKILL** (`kill -9`) | `137` | 0 bytes | — |
+
+The last two rows matter most, because *your own runner sends those signals*. Any per-run
+timeout — including the one in `run-loop.sh` — lands here on every wedged run.
+
+**Why the silence.** This is the part worth internalising. Given an empty stdin, `jq` **succeeds**:
+
+```sh
+$ : | jq -r '.result'  ; echo "exit=$?"
+exit=0                     # ← no output, no error, no complaint
+
+$ : | jq '.'            ; echo "exit=$?"
+exit=0
+
+$ : | jq -e '.is_error' ; echo "exit=$?"
+exit=4                     # ← the only one that notices
+```
+
+So the idiomatic `result=$(claude -p ... | jq -r '.result')` sets `result` to the empty string
+and returns 0. Nothing in the pipeline objects. Note this is the **exact opposite** of #1: there,
+merging stderr into stdout makes `jq` fail *loudly* with a parse error. Here, stdout is genuinely
+empty and `jq` fails *silently*. Two failure modes, opposite symptoms, both caused by not
+separating the streams properly.
+
+**Fix.** Check that the file is non-empty before you parse it, and treat exit codes above 128 as
+signals rather than as application failures:
+
+```sh
+claude -p "$PROMPT" --output-format json >"$out" 2>"$err" </dev/null
+code=$?
+
+if [ ! -s "$out" ]; then
+    if [ "$code" -gt 128 ]; then
+        echo "killed by signal $(( code - 128 )) after ${TIMEOUT}s" >&2   # 143=TERM 137=KILL
+    else
+        echo "pre-flight failure (exit $code): $(head -1 "$err")" >&2
+    fi
+    # do NOT parse $out — there is nothing in it
+    return 1
+fi
+
+jq -e '.is_error' "$out" >/dev/null && return 1
+```
+
+`[ ! -s "$out" ]` is the whole fix. It is one line, and it is the line that separates a runner
+that reports its own timeouts from one that logs them as successes.
+
+---
+
+## #7. Every backgrounded run waits 3 seconds for stdin that never comes
+
+**Symptom.** Runs take a few seconds longer than they should, with nothing in the timing fields
+to explain it. `.duration_ms` does not account for it.
+
+**What it looks like.** Captured on stderr from a run started with `&`:
+
+```
+Warning: no stdin data received in 3s, proceeding without it. If piping from a slow command,
+redirect stdin explicitly: < /dev/null to skip, or wait longer.
+```
+
+**Cause.** When stdin is not a terminal — backgrounded, cron, CI, `systemd`, a Python
+`subprocess` without `stdin=DEVNULL` — the CLI waits for piped input before giving up. Passing
+the prompt as an argument does not skip the wait. Unattended runs are *by definition* the case
+where stdin is not a terminal, so this is not an edge case for a loop: it is every single run.
+
+**Cost.** 3 seconds per invocation. On a five-minute loop that is ~1% of wall-clock and about
+850 wasted seconds a day; on a tight CI matrix it is more visible than that.
+
+**Fix.** One redirect, on every invocation:
+
+```sh
+claude -p "$PROMPT" --output-format json >"$out" 2>"$err" </dev/null
+```
+
+The vendor's own message names this fix, but the message only appears on stderr — which you
+are discarding, if you followed #1 and sent stderr to a file nobody reads.
+
+---
+
+## #8. A misspelled tool name in allowedTools is accepted silently
+
+**Symptom.** You restrict an unattended run to a small set of tools, the run succeeds, and the
+restriction was never what you thought it was.
+
+**Reproduction.** `NotARealTool` does not exist:
+
+```sh
+claude -p 'hi' --output-format json --allowedTools 'NotARealTool(x:*)'
+# exit=0, is_error=false, normal payload, empty stderr
+```
+
+Exit `0`. No warning, on either stream. Nothing in the payload records that the name was not
+recognised.
+
+**Why it matters unattended.** Tool names are the security boundary of a `-p` run. A typo, a
+renamed tool, or a copy-paste from an older config all fail the same way: **silently, in the
+permissive direction**, on a run that reports success. There is no output to alert on, so the
+only place to catch it is before the run.
+
+**Fix.** Validate the names yourself against a list you maintain, and fail closed:
+
+```sh
+KNOWN='Bash|Read|Write|Edit|Glob|Grep|WebFetch|WebSearch|Task|TodoWrite|NotebookEdit'
+for t in "${TOOLS[@]}"; do
+    printf '%s' "$t" | grep -qE "^($KNOWN)(\(|$)" || { echo "unknown tool: $t" >&2; exit 2; }
+done
+```
+
+**[unverified]** whether an *unparseable* value (as opposed to a well-formed name for a tool
+that does not exist) is also accepted; we only tested the well-formed case.
+
+---
+
+## #9. Your timeout watchdog leaks a process and holds the pipe open
+
+Not a Claude Code behaviour — a bug in the obvious way to write the timeout that #6 requires.
+We shipped it in `run-loop.sh` and then hit it ourselves. If you wrote your own watchdog, you
+probably have it too.
+
+**The obvious version:**
+
+```sh
+claude "${args[@]}" > "$out" 2> "$err" &
+pid=$!
+( sleep "$TIMEOUT"; kill -0 "$pid" 2>/dev/null && kill -TERM "$pid" 2>/dev/null ) &
+watchdog=$!
+wait "$pid"; code=$?
+kill "$watchdog" 2>/dev/null; wait "$watchdog" 2>/dev/null   # looks like cleanup
+```
+
+**Three things wrong with it.**
+
+1. **It leaks one process per run.** `kill "$watchdog"` kills the *subshell*, not the `sleep`
+   inside it. The `sleep` is reparented to init and runs out the full timeout. On a loop with
+   `--timeout 1800`, every run leaves a 30-minute `sleep` behind. We found five of ours with:
+
+   ```sh
+   ps -eo pid,ppid,etime,command | grep '[s]leep 1800'
+   ```
+
+2. **It hangs anything reading your output.** The orphaned `sleep` inherited stdout. So it holds
+   the write end of the pipe open, and `./run-loop.sh | tee log`, `| tail`, or `$(./run-loop.sh)`
+   blocks for the *entire remaining timeout* after the loop has already exited. The symptom is
+   maddening: the log file is complete, the script is gone from `ps`, and your terminal sits
+   there. That is how we found it.
+
+3. **`-TERM` alone is not a hard kill.** A process that ignores SIGTERM is never killed, the
+   watchdog exits, and `wait "$pid"` blocks forever — a timeout that makes hangs permanent.
+
+**The fixed version:**
+
+```sh
+( exec >/dev/null 2>&1                    # (2) don't hold the caller's pipe
+  sleep "$TIMEOUT"
+  kill -0 "$pid" 2>/dev/null || exit 0
+  kill -TERM "$pid" 2>/dev/null
+  sleep 10                                # (3) grace, then escalate
+  kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null ) &
+watchdog=$!
+
+wait "$pid"; code=$?
+pkill -P "$watchdog" 2>/dev/null          # (1) kill the sleep FIRST, while it still has a parent
+kill "$watchdog" 2>/dev/null; wait "$watchdog" 2>/dev/null
+
+case "$code" in 143|137) timed_out=1 ;; esac
+```
+
+Order matters in the cleanup: `pkill -P` finds the `sleep` by its parent, so it only works
+*before* you kill the parent. Reverse the two lines and you are back to leaking.
+
+**Verifying your own.** Run one cycle through a pipe and time it:
+
+```sh
+time ./run-loop.sh --prompt-file ./PROMPT.md --once | tail -3
+```
+
+If that takes ~0s, you are fine. If it prints everything and then sits there, you have #9.
+
+---
+
 ## The `--output-format json` payload: field reference
 
 Every field below was read off two real payloads captured minutes apart on Claude Code as of
@@ -508,7 +775,15 @@ What it does that a naive `while true; do claude -p ...; done` does not:
   of every run in its own file
 - **Warns when your allowlist was silently dropped** (#2)
 - **Classifies on exit code + `is_error`**, not on `subtype` (#3)
-- **Per-run timeout** with a hard kill, so one wedged run does not stall the loop forever
+- **Refuses to parse an empty payload** — checks `[ -s "$out" ]` first and reports the stderr
+  line instead, so pre-flight failures and killed runs are logged with a cause rather than as
+  an unexplained "unparseable" failure (#6)
+- **Per-run timeout that escalates** — SIGTERM, 10s grace, then SIGKILL, so a run that ignores
+  SIGTERM cannot stall the loop forever. Both `143` and `137` are classified as timeouts (#6).
+  Note this kills the `claude` process itself, not any subprocess it may have spawned
+- **A watchdog that does not leak** — its `sleep` is killed before the watchdog itself and its
+  output is redirected, so it neither leaks a process per run nor holds your stdout pipe open
+  for the full timeout after the loop exits (see below)
 - **Circuit breaker that exits** — stops the process after N consecutive failures rather than
   cooling down and re-tripping forever, which is the oscillation in #5
 - **Cost accounting** — per-run and cumulative `total_cost_usd` in the log
@@ -552,14 +827,28 @@ Verified here, by reproduction, on macOS 15 with Claude Code as of 2026-07:
   path, `modelUsage: {}` on failure, and the `usage`/`modelUsage` snake_case/camelCase split
 - every string in [Exact strings, one per heading](#exact-strings-one-per-heading), copied out of
   a real run rather than paraphrased
+- #6 all seven rows of the zero-byte table — five pre-flight failures run individually, plus
+  SIGTERM and SIGKILL delivered to a live run with `kill` — and the three `jq` exit codes on
+  empty input (`jq -r` → 0, `jq .` → 0, `jq -e` → 4), which is what makes the class silent
+- #7 the stdin warning, its exact text, and that it appears on a backgrounded run
+- #8 that `--allowedTools 'NotARealTool(x:*)'` exits `0` with `is_error: false` and no warning
+  on either stream
+- #9 on our own runner, both symptoms: five orphaned `sleep 1800` processes counted in `ps`,
+  and a `| tail` that blocked until we killed the orphan by hand. The fix was then verified
+  against a stub that traps and ignores SIGTERM — it is killed with signal 9 after the 10s
+  grace, the run is classified as a timeout, the pipe returns in 0s, and no process leaks
 - `run-loop.sh` itself, end to end, on both a successful run and a 429
 
 Not verified, and deliberately not claimed:
 
 - that accepting the trust dialog or editing `~/.claude.json` resolves #2 (vendor instruction, untested here)
-- exit-code behaviour for failure classes other than an API 404
+- exit-code behaviour for API failure classes other than 404 and 429 (the *non-API* classes are
+  now covered in [#6](#6-some-failures-produce-no-json-at-all-and-your-jq-check-will-not-notice))
 - any behaviour on Linux or Windows, or under a different Claude Code version
-- `--output-format stream-json`, which this document does not cover at all
+- `--output-format stream-json` beyond its pre-flight `--verbose` requirement; the streaming
+  payload shape itself is not covered here
+- whether a *malformed* `--allowedTools` value is rejected; only a well-formed name for a
+  nonexistent tool was tested (#8)
 
 If you hit something here that does not reproduce for you, open an issue with your CLI version
 and the exact output. Corrections are the most useful thing you can send.
