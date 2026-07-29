@@ -16,9 +16,9 @@ Prefer one page per error? Each of the most common strings also has a self-conta
 
 | What you saw | What actually happened | Fix |
 |---|---|---|
-| `jq: parse error: Invalid numeric literal at line 1, column 9` | You captured the CLI with `2>&1`. Notices go to **stderr**, JSON goes to **stdout**. Merging them puts a non-JSON line in front of the payload. | [#1](#1-2raw1-corrupts---output-format-json) |
+| `jq: parse error: Invalid numeric literal at line 1, column 9` | You captured the CLI with `2>&1`. Notices go to **stderr**, JSON goes to **stdout**. Merging them puts a non-JSON line in front of the payload. | [#1](#1-21-corrupts---output-format-json) |
 | `Ignoring N permissions.allow entries from .claude/settings.json: this workspace has not been trusted.` | Your `.claude/settings.json` allowlist is being **silently dropped**. The run continues, so nothing looks broken until a tool call is refused. | [#2](#2-permissionsallow-is-silently-dropped-in-an-untrusted-workspace) |
-| Your script logged a **successful** run as failed | You classified on `.subtype`, which was empty because of #1. | [#1](#1-2raw1-corrupts---output-format-json) |
+| Your script logged a **successful** run as failed | You classified on `.subtype`, which was empty because of #1. | [#1](#1-21-corrupts---output-format-json) |
 | Your script logged a **failed** run as successful | `.subtype` is `"success"` even when `.is_error` is `true`. Classify on `.is_error`, not `.subtype`. | [#3](#3-subtype-is-success-even-when-the-run-failed) |
 | `You've hit your session limit · resets 3:50pm (Asia/Tokyo)` | A 429. Your loop is counting it as an agent failure and will trip its own circuit breaker on it. | [#4](#4-a-429-will-trip-your-circuit-breaker) |
 | Your loop tripped the breaker, cooled down, and tripped it again — for hours | The breaker's cooldown is shorter than the rate-limit window, so it oscillates instead of stopping. Meanwhile your restore-on-failure handler is eating the work that succeeded. | [#5](#5-a-breaker-cannot-outlast-a-rate-limit-and-your-restore-handler-eats-the-good-runs) |
@@ -42,7 +42,7 @@ rather read one page about one error than scroll this file:
 
 Not a malformed payload. You merged stderr into stdout with `2>&1`, so a human-readable notice
 sits in front of the JSON. The column number varies with the notice; the shape does not.
-→ [#1](#1-2raw1-corrupts---output-format-json) · [standalone answer](https://github.com/19800104zhao-svg/claude-code-unattended/issues/3)
+→ [#1](#1-21-corrupts---output-format-json) · [standalone answer](https://github.com/19800104zhao-svg/claude-code-unattended/issues/3)
 
 ### `Ignoring 7 permissions.allow entries from .claude/settings.json: this workspace has not been trusted.`
 
@@ -362,7 +362,7 @@ $ grep -l '"api_error_status":429' logs/cycle-*.log | wc -l   # 102
 **105 cycles, zero of them ever logged as OK.** Two independent defects stacked:
 
 *Cycles 1–3* were real successes — `is_error:false`, `total_cost_usd` of `4.78`, `6.74`, `8.32` —
-logged as failures because of [#1](#1-2raw1-corrupts---output-format-json). Roughly $20 of
+logged as failures because of [#1](#1-21-corrupts---output-format-json). Roughly $20 of
 completed work, filed as three failures.
 
 *Cycles 5–105* were **101 consecutive 429s** from a single account-level session limit that
