@@ -11,6 +11,9 @@ pasted verbatim. Anything we did *not* reproduce is marked **[unverified]** and 
 
 ## Arrived here from an error message? Start here.
 
+Prefer one page per error? Each of the most common strings also has a self-contained answer in
+[the error index](https://github.com/19800104zhao-svg/claude-code-unattended/issues?q=is%3Aissue+label%3Aerror-index).
+
 | What you saw | What actually happened | Fix |
 |---|---|---|
 | `jq: parse error: Invalid numeric literal at line 1, column 9` | You captured the CLI with `2>&1`. Notices go to **stderr**, JSON goes to **stdout**. Merging them puts a non-JSON line in front of the payload. | [#1](#1-2raw1-corrupts---output-format-json) |
@@ -27,24 +30,28 @@ pasted verbatim. Anything we did *not* reproduce is marked **[unverified]** and 
 If you pasted an error into a search engine and it sent you here, the literal text is below.
 Every string is copied out of a real run — no paraphrase, no reconstruction from memory.
 
+Most entries also have a **standalone, self-contained answer** as a pinned issue, if you would
+rather read one page about one error than scroll this file:
+[the error index](https://github.com/19800104zhao-svg/claude-code-unattended/issues?q=is%3Aissue+label%3Aerror-index).
+
 ### `jq: parse error: Invalid numeric literal at line 1, column 9`
 
 Not a malformed payload. You merged stderr into stdout with `2>&1`, so a human-readable notice
 sits in front of the JSON. The column number varies with the notice; the shape does not.
-→ [#1](#1-2raw1-corrupts---output-format-json)
+→ [#1](#1-2raw1-corrupts---output-format-json) · [standalone answer](https://github.com/19800104zhao-svg/claude-code-unattended/issues/3)
 
 ### `Ignoring 7 permissions.allow entries from .claude/settings.json: this workspace has not been trusted.`
 
 Emitted on **stderr**, on every run, in any workspace that has a `.claude/settings.json` but has
 never been opened interactively. The count varies with the number of entries; `Ignoring 1
 permissions.allow entry` is the singular form. Your allowlist is doing nothing.
-→ [#2](#2-permissionsallow-is-silently-dropped-in-an-untrusted-workspace)
+→ [#2](#2-permissionsallow-is-silently-dropped-in-an-untrusted-workspace) · [standalone answer](https://github.com/19800104zhao-svg/claude-code-unattended/issues/1)
 
 ### `Run Claude Code interactively here once and accept the trust dialog, or set projects["/Users/you/project"].hasTrustDialogAccepted: true in /Users/you/.claude.json.`
 
 The second half of the same stderr notice. This is the vendor's own remediation text — we
 reproduce it verbatim but have **[unverified]** whether either branch resolves it.
-→ [#2](#2-permissionsallow-is-silently-dropped-in-an-untrusted-workspace)
+→ [#2](#2-permissionsallow-is-silently-dropped-in-an-untrusted-workspace) · [standalone answer](https://github.com/19800104zhao-svg/claude-code-unattended/issues/1)
 
 ### `You've hit your session limit · resets 3:50pm (Asia/Tokyo)`
 
@@ -52,37 +59,37 @@ An API **429**, delivered as `.result` prose. Note the wording is **`session lim
 "usage limit", not "rate limit", not "quota exceeded". A grep written against those three
 phrases misses it, and the run lands in your failure branch. The reset time is rendered in the
 machine's local timezone.
-→ [#4](#4-a-429-will-trip-your-circuit-breaker)
+→ [#4](#4-a-429-will-trip-your-circuit-breaker) · [standalone answer](https://github.com/19800104zhao-svg/claude-code-unattended/issues/2)
 
 ### `There's an issue with the selected model (no-such-model-xyz). It may not exist or you may not have access to it. Run --model to pick a different model.`
 
 An API **404**, also delivered as `.result` prose. Exit code `1`, `is_error: true`,
 `total_cost_usd: 0`, `num_turns: 1` — and `subtype: "success"`.
-→ [#3](#3-subtype-is-success-even-when-the-run-failed)
+→ [#3](#3-subtype-is-success-even-when-the-run-failed) · [standalone answer](https://github.com/19800104zhao-svg/claude-code-unattended/issues/6)
 
 ### `"subtype":"success"` on a payload that also carries `"is_error":true`
 
 Not a contradiction the CLI will ever resolve for you. `subtype` has been `"success"` in every
 failure we have captured. Classify on `is_error`.
-→ [#3](#3-subtype-is-success-even-when-the-run-failed)
+→ [#3](#3-subtype-is-success-even-when-the-run-failed) · [standalone answer](https://github.com/19800104zhao-svg/claude-code-unattended/issues/4)
 
 ### `"stop_reason":"stop_sequence"` on a run that never reached the model
 
 Observed on the 404 path. Nothing stopped at a stop sequence — nothing started. `stop_reason`
 describes a turn that did not happen, so it is not a health signal.
-→ [payload reference](#the---output-format-json-payload-field-reference)
+→ [payload reference](#the---output-format-json-payload-field-reference) · [standalone answer](https://github.com/19800104zhao-svg/claude-code-unattended/issues/5)
 
 ### `"terminal_reason":"api_error"` / `"terminal_reason":"completed"`
 
 The one string-typed field we have found that tracks reality: `"completed"` on success,
 `"api_error"` on both the 404 and the 429. Useful as a secondary check alongside `is_error`.
-→ [payload reference](#the---output-format-json-payload-field-reference)
+→ [payload reference](#the---output-format-json-payload-field-reference) · [standalone answer](https://github.com/19800104zhao-svg/claude-code-unattended/issues/5)
 
 ### `"api_error_status":404` / `"api_error_status":429` / `"api_error_status":null`
 
 `null` on success, an integer HTTP status on API failure. Branch on this rather than on prose
 the vendor is free to reword.
-→ [#4](#4-a-429-will-trip-your-circuit-breaker)
+→ [#4](#4-a-429-will-trip-your-circuit-breaker) · [standalone answer](https://github.com/19800104zhao-svg/claude-code-unattended/issues/7)
 
 ---
 
