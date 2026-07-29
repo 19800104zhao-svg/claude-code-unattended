@@ -110,14 +110,31 @@ run_once() {
     claude "${args[@]}" < "$PROMPT_FILE" > "$OUT_FILE" 2> "$ERR_FILE" &
     local pid=$!
 
-    ( sleep "$TIMEOUT"; kill -0 "$pid" 2>/dev/null && kill -TERM "$pid" 2>/dev/null ) &
+    # SIGTERM first, then escalate. A run that ignores SIGTERM would otherwise
+    # hang `wait` forever and stall the loop with no timeout at all — which is
+    # not what "hard kill" should mean.
+    # `exec >/dev/null 2>&1` matters more than it looks: without it the watchdog
+    # inherits our stdout, and its `sleep` keeps that pipe open after we kill the
+    # subshell. Anything reading us — `| tee`, `| tail`, `$(...)` — then blocks
+    # for the full TIMEOUT after the loop has already exited.
+    ( exec >/dev/null 2>&1
+      sleep "$TIMEOUT"
+      kill -0 "$pid" 2>/dev/null || exit 0
+      kill -TERM "$pid" 2>/dev/null
+      sleep 10
+      kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null ) &
     local watchdog=$!
 
     wait "$pid"; RUN_EXIT=$?
+    # Kill the watchdog's `sleep` BEFORE the watchdog itself. Reverse the order
+    # and the sleep is reparented to init and leaks one process per run.
+    pkill -P "$watchdog" 2>/dev/null
     kill "$watchdog" 2>/dev/null; wait "$watchdog" 2>/dev/null
 
-    # 143 = SIGTERM, i.e. the watchdog fired.
-    [ "$RUN_EXIT" -eq 143 ] && TIMED_OUT=1
+    # #6: exit codes above 128 are signals, not application failures.
+    # 143 = 128+15 SIGTERM (watchdog), 137 = 128+9 SIGKILL (escalation).
+    # Neither leaves any JSON behind, so there is nothing to classify.
+    case "$RUN_EXIT" in 143|137) TIMED_OUT=1 ;; esac
     return 0
 }
 
@@ -142,7 +159,17 @@ while true; do
 
     if [ "$TIMED_OUT" -eq 1 ]; then
         error_count=$((error_count + 1))
-        log "run #$run_count [FAIL] timed out after ${TIMEOUT}s (errors: $error_count/$MAX_ERRORS)"
+        log "run #$run_count [FAIL] timed out after ${TIMEOUT}s, killed with signal" \
+            "$((RUN_EXIT - 128)) (errors: $error_count/$MAX_ERRORS)"
+    elif [ ! -s "$OUT_FILE" ]; then
+        # #6: a pre-flight failure (bad flag, invalid --output-format, dead
+        # --resume session, empty prompt) produces NO payload at all. Parsing an
+        # empty file yields empty strings from jq without any error, so this must
+        # be caught before the classifier runs or it reads as an unparseable
+        # failure with no cause attached. The stderr line is the only evidence.
+        error_count=$((error_count + 1))
+        log "run #$run_count [FAIL] no JSON produced (exit=$RUN_EXIT) —" \
+            "$(head -1 "$ERR_FILE" 2>/dev/null) (errors: $error_count/$MAX_ERRORS)"
     else
         is_error=$(json_field "$OUT_FILE" is_error)
         cost=$(json_field "$OUT_FILE" total_cost_usd)
