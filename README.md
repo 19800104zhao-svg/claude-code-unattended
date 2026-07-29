@@ -18,6 +18,7 @@ pasted verbatim. Anything we did *not* reproduce is marked **[unverified]** and 
 | Your script logged a **successful** run as failed | You classified on `.subtype`, which was empty because of #1. | [#1](#1-2raw1-corrupts---output-format-json) |
 | Your script logged a **failed** run as successful | `.subtype` is `"success"` even when `.is_error` is `true`. Classify on `.is_error`, not `.subtype`. | [#3](#3-subtype-is-success-even-when-the-run-failed) |
 | `You've hit your session limit · resets 3:50pm (Asia/Tokyo)` | A 429. Your loop is counting it as an agent failure and will trip its own circuit breaker on it. | [#4](#4-a-429-will-trip-your-circuit-breaker) |
+| Your loop tripped the breaker, cooled down, and tripped it again — for hours | The breaker's cooldown is shorter than the rate-limit window, so it oscillates instead of stopping. Meanwhile your restore-on-failure handler is eating the work that succeeded. | [#5](#5-a-breaker-cannot-outlast-a-rate-limit-and-your-restore-handler-eats-the-good-runs) |
 
 ---
 
@@ -212,6 +213,82 @@ trouble.
 
 ---
 
+## #5. A breaker cannot outlast a rate limit, and your restore handler eats the good runs
+
+**Symptom.** Your loop spends an afternoon in a stable oscillation: five failures, breaker trips,
+cooldown, five more failures, breaker trips. It never converges and it never stops. When you come
+back, the state file looks like it did hours ago.
+
+**This one we did not construct.** It happened to the loop that produced this repo, and the
+numbers below are counted out of its own log, not estimated:
+
+```
+$ grep -c '\[FAIL\]'            logs/auto-loop.log   # 105
+$ grep -c '\[OK\]'              logs/auto-loop.log   # 0
+$ grep -c 'BREAKER'             logs/auto-loop.log   # 21
+$ grep -c 'state restored'      logs/auto-loop.log   # 104
+$ grep -l '"api_error_status":429' logs/cycle-*.log | wc -l   # 102
+```
+
+**105 cycles, zero of them ever logged as OK.** Two independent defects stacked:
+
+*Cycles 1–3* were real successes — `is_error:false`, `total_cost_usd` of `4.78`, `6.74`, `8.32` —
+logged as failures because of [#1](#1-2raw1-corrupts---output-format-json). Roughly $20 of
+completed work, filed as three failures.
+
+*Cycles 5–105* were **101 consecutive 429s** from a single account-level session limit that
+lasted 2h34m (13:14 → the `resets 3:50pm` in the payload). Each was counted against the breaker
+per [#4](#4-a-429-will-trip-your-circuit-breaker).
+
+**Why the breaker made it worse instead of better.** The breaker was configured `--max-errors 5`
+with a 300s cooldown, against a 30s interval. Five failed cycles take about three minutes, the
+cooldown five more — so the loop settles into an ~8-minute cycle of trip → cool → trip that it
+cannot leave until the limit lifts on its own. It tripped **21 times**. A circuit breaker whose
+cooldown is shorter than the outage it is reacting to does not stop anything; it just adds a
+duty cycle. Ours was doing its job perfectly and was useless, because the thing it was breaking
+on was not a fault.
+
+**The expensive half.** The runner also had a `restore_state` handler on the failure path — back
+up the state file before each run, roll it back if the run fails. Ordinary, defensible, and it
+fired **104 times**. Every 429 reverted the state file to a snapshot taken before any of it
+happened. Cycle 4 had already shipped a real artifact and written that fact into state; 101
+rate limits later, state said the work had never been done.
+
+**Fixes.** Three, in order of how much they buy you:
+
+1. **Never restore state on a failure you did not diagnose.** A restore handler is a rollback
+   with no review. Back up, and leave the restoring to a human — or gate it to the one failure
+   class you actually mean, which is almost never "the API said not now".
+
+   ```sh
+   # wrong: any non-zero outcome silently reverts hours of work
+   [ "$ok" -eq 1 ] || restore_state
+
+   # right: keep the backup, say what happened, let a human decide
+   [ "$ok" -eq 1 ] || log "cycle failed; state left as-is, backup at $STATE.bak"
+   ```
+
+2. **Exclude rate limits from the breaker** ([#4](#4-a-429-will-trip-your-circuit-breaker)) — a
+   429 is not a consecutive failure, and it must not reach the counter at all.
+
+3. **Make the cooldown outlast the outage, or stop.** If the breaker trips more than twice in a
+   row, the cooldown is too short for whatever is wrong. Back off exponentially, or exit non-zero
+   and let your supervisor decide.
+
+   ```sh
+   if [ "$breaker_trips" -ge 2 ]; then
+       cooldown=$(( cooldown * 4 ))     # 300 → 1200 → 4800
+   fi
+   ```
+
+**The general shape.** Every unattended loop has a failure path, and the failure path is the
+part nobody exercises before shipping. Ours had three defenses on it — a classifier, a breaker,
+and a rollback — and all three, working exactly as designed, combined into a machine that spent
+2h34m destroying its own output. Test the failure path against a *sustained* fault, not a
+one-off one. `--model no-such-model-xyz` in a loop for an hour costs nothing and finds this.
+
+---
+
 ## The `--output-format json` payload
 
 Top-level keys observed on Claude Code as of 2026-07 (`claude-opus-5` / `claude-sonnet-5`):
@@ -262,12 +339,14 @@ What it does that a naive `while true; do claude -p ...; done` does not:
 - **Warns when your allowlist was silently dropped** (#2)
 - **Classifies on exit code + `is_error`**, not on `subtype` (#3)
 - **Per-run timeout** with a hard kill, so one wedged run does not stall the loop forever
-- **Circuit breaker** — stops after N consecutive failures instead of burning budget in a
-  crash loop at 3am
+- **Circuit breaker that exits** — stops the process after N consecutive failures rather than
+  cooling down and re-tripping forever, which is the oscillation in #5
 - **Cost accounting** — per-run and cumulative `total_cost_usd` in the log
-- **Rate-limit backoff** — treats a 429 as "not now" rather than as a failure, so the breaker
-  is not spent on it (#4)
-- **Crash-safe state file** — backed up before each run, restored only on genuine failure
+- **Escalating rate-limit backoff** — treats a 429 as "not now" rather than as a failure, so the
+  breaker is not spent on it (#4), and backs off 1× → 4× → 12× (capped at 1h) while the limit
+  persists instead of hammering on a fixed interval for hours (#5)
+- **A state file it never silently rolls back** — written after every run, and left exactly as
+  it is when a run fails. There is no restore handler, on purpose (#5)
 
 ```
 Usage: run-loop.sh [options]
@@ -294,6 +373,9 @@ Verified here, by reproduction, on macOS 15 with Claude Code as of 2026-07:
 - #2 the untrusted-workspace notice, its exact text, and that it lands on stderr
 - #3 `subtype: "success"` alongside `is_error: true`, and the two exit codes in the table
 - #4 the 429 shape and its exact `result` wording, hit accidentally while testing `run-loop.sh`
+- #5 in production, not in a test harness — 105 cycles, 21 breaker trips, 104 state rollbacks,
+  102 payloads carrying `api_error_status: 429`, all counted out of the log with the `grep`s
+  printed in that section
 - the payload key list above
 - `run-loop.sh` itself, end to end, on both a successful run and a 429
 
@@ -313,7 +395,8 @@ and the exact output. Corrections are the most useful thing you can send.
 
 We run an autonomous Claude Code loop — an agent that wakes on a timer, does a work cycle,
 writes its own state file, and goes back to sleep, with no human in the loop. Every failure
-mode above cost us a real cycle before we found it. #1 cost three.
+mode above cost us a real cycle before we found it. #1 cost three. #5 cost 101 in a row, plus
+the four good cycles its rollback handler quietly undid.
 
 If you are building the same thing and want the hardened harness rather than the writeup:
 
